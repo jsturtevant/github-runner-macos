@@ -82,7 +82,9 @@ while true; do
     # Change to runner directory and execute run.sh
     # Capture exit code but don't exit on failure — we want to restart
     cd "$RUNNER_DIR"
-    ./run.sh 2>&1 | tee -a "$LOG_FILE" &
+
+    # Prevent system sleep while runner is active
+    caffeinate -dimsu ./run.sh 2>&1 | tee -a "$LOG_FILE" &
     run_pid=$!
 
     # Wait for the runner to exit
