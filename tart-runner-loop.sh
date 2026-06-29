@@ -85,6 +85,32 @@ fi
 # Stable per-index clone name. Reused each iteration (deleted at end of loop),
 # so leftover clones from a crash are reclaimed on the next pass.
 CLONE_NAME="${TART_GOLDEN_IMAGE}-runner-${INDEX}"
+FAILURE_STATE_FILE="${TART_CONFIG_DIR}/runner-${INDEX}.failure-epochs"
+
+# Clear failure history after a successful job so only fresh incidents count.
+clear_failure_history() {
+    rm -f "$FAILURE_STATE_FILE" 2>/dev/null || true
+}
+
+# Track recent failures and apply a longer cooldown if they are frequent.
+record_failure_and_maybe_cooldown() {
+    mkdir -p "$TART_CONFIG_DIR"
+
+    local now cutoff failures
+    now="$(date +%s)"
+    cutoff=$(( now - TART_FAILURE_WINDOW_SEC ))
+
+    printf '%s\n' "$now" >> "$FAILURE_STATE_FILE"
+    awk -v cutoff="$cutoff" '$1 >= cutoff' "$FAILURE_STATE_FILE" > "${FAILURE_STATE_FILE}.tmp" || true
+    mv -f "${FAILURE_STATE_FILE}.tmp" "$FAILURE_STATE_FILE"
+
+    failures="$(wc -l < "$FAILURE_STATE_FILE" | tr -d ' ')"
+    if [ "$failures" -ge "$TART_FAILURE_THRESHOLD" ]; then
+        err "[runner ${INDEX}] ${failures} failures in ${TART_FAILURE_WINDOW_SEC}s; cooling down for ${TART_FAILURE_COOLDOWN_SEC}s"
+        sleep "$TART_FAILURE_COOLDOWN_SEC"
+        clear_failure_history
+    fi
+}
 
 # Remove a clone if it exists (handles leftovers from a previous crash).
 delete_clone_if_present() {
@@ -129,13 +155,15 @@ run_one_job() {
 
     # Configure as an ephemeral runner and execute a single job. run.sh blocks
     # until the job finishes, after which the ephemeral runner deregisters.
-    ssh_guest "$ip" \
+    if ! ssh_guest "$ip" \
         "cd '${TART_GUEST_RUNNER_DIR}' && \
          ./config.sh --unattended --ephemeral --replace \
             --url '${RUNNER_URL}' --token '${token}' \
             --labels '${TART_RUNNER_LABELS}' --name '${runner_name}' && \
-         ./run.sh" \
-        || err "[runner ${INDEX}] Runner exited non-zero (job may have failed)"
+         ./run.sh"; then
+        err "[runner ${INDEX}] Runner exited non-zero (job may have failed)"
+        return 1
+    fi
 
     log "[runner ${INDEX}] Job finished; tearing down ${CLONE_NAME}"
     # cleanup_job runs via the RETURN trap.
@@ -147,8 +175,11 @@ log "[runner ${INDEX}] Golden image: ${TART_GOLDEN_IMAGE}, labels: ${TART_RUNNER
 # Endless loop. launchd (KeepAlive) restarts us if the process itself dies; the
 # short sleep on failure avoids hammering GitHub/Tart in a tight crash loop.
 while true; do
-    if ! run_one_job; then
+    if run_one_job; then
+        clear_failure_history
+    else
         err "[runner ${INDEX}] Iteration failed; backing off before retry"
+        record_failure_and_maybe_cooldown
         sleep 10
     fi
 done

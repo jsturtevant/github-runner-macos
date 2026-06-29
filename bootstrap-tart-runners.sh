@@ -47,12 +47,20 @@ Optional:
   --golden-image <name>    Golden image name. Default: gha-ubuntu-kvm.
   --base-image <ref>       Base OCI image. Default: ghcr.io/cirruslabs/ubuntu:latest.
   --runner-version <x.y.z> Actions runner version baked in. Default: latest.
+    --cpus <n>               Guest vCPUs in the baked image. Default: 4.
+    --memory-mb <mb>         Guest RAM in MB in the baked image. Default: 8192.
+    --disk-gb <gb>           Guest disk size in GB in the baked image. Default: 50.
   --labels <csv>           Runner labels. Default: arm64,kvm,linux,ubuntu-24.04.
   --name-prefix <prefix>   Runner name prefix. Default: tart-ubuntu.
   --rebuild-image          Force a rebuild of the golden image even if it exists.
   --install-launchd        Install/reload a launchd service per runner.
+    --launchd-scope <scope>  launchd scope: agent|daemon. Default: agent.
+    --launchd-user <user>    User account for daemon scope. Default: current user.
+    --launchd-dir <dir>      Directory for plist files.
+                                                        Defaults: ~/Library/LaunchAgents (agent),
+                                                                            /Library/LaunchDaemons (daemon).
   --launchd-label-prefix <p>  launchd label prefix. Default: com.github.tart-runner.
-  --launch-agents-dir <dir>   LaunchAgents dir. Default: ~/Library/LaunchAgents.
+    --launch-agents-dir <dir>   Back-compat alias for --launchd-dir.
   -h, --help               Show this help.
 EOF
 }
@@ -67,7 +75,10 @@ RUNNER_VERSION=""
 REBUILD_IMAGE=false
 INSTALL_LAUNCHD=false
 LAUNCHD_LABEL_PREFIX="com.github.tart-runner"
-LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LAUNCHD_SCOPE="agent"
+LAUNCHD_USER="${SUDO_USER:-$USER}"
+LAUNCHD_DIR=""
+RUNNER_HOME=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -79,12 +90,18 @@ while [ "$#" -gt 0 ]; do
         --golden-image) TART_GOLDEN_IMAGE="${2:-}"; shift 2 ;;
         --base-image) TART_BASE_IMAGE="${2:-}"; shift 2 ;;
         --runner-version) RUNNER_VERSION="${2:-}"; shift 2 ;;
+        --cpus) TART_GUEST_CPUS="${2:-}"; shift 2 ;;
+        --memory-mb) TART_GUEST_MEMORY_MB="${2:-}"; shift 2 ;;
+        --disk-gb) TART_GUEST_DISK_GB="${2:-}"; shift 2 ;;
         --labels) TART_RUNNER_LABELS="${2:-}"; shift 2 ;;
         --name-prefix) NAME_PREFIX="${2:-}"; shift 2 ;;
         --rebuild-image) REBUILD_IMAGE=true; shift ;;
         --install-launchd) INSTALL_LAUNCHD=true; shift ;;
+        --launchd-scope) LAUNCHD_SCOPE="${2:-}"; shift 2 ;;
+        --launchd-user) LAUNCHD_USER="${2:-}"; shift 2 ;;
+        --launchd-dir) LAUNCHD_DIR="${2:-}"; shift 2 ;;
         --launchd-label-prefix) LAUNCHD_LABEL_PREFIX="${2:-}"; shift 2 ;;
-        --launch-agents-dir) LAUNCH_AGENTS_DIR="${2:-}"; shift 2 ;;
+        --launch-agents-dir) LAUNCHD_DIR="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -112,6 +129,27 @@ fi
 # with a different working directory, so relative paths would break.
 PRIVATE_KEY="$(cd "$(dirname "$PRIVATE_KEY")" && pwd)/$(basename "$PRIVATE_KEY")"
 
+resolve_launchd_layout() {
+    case "$LAUNCHD_SCOPE" in
+        agent)
+            RUNNER_HOME="$HOME"
+            [ -n "$LAUNCHD_DIR" ] || LAUNCHD_DIR="$HOME/Library/LaunchAgents"
+            ;;
+        daemon)
+            [ "$(id -u)" -eq 0 ] || die "--launchd-scope daemon requires root. Re-run with sudo."
+            [ -n "$LAUNCHD_USER" ] || die "--launchd-user is required for daemon scope."
+            RUNNER_HOME="$(dscl . -read "/Users/${LAUNCHD_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+            [ -n "$RUNNER_HOME" ] || RUNNER_HOME="/Users/${LAUNCHD_USER}"
+            [ -n "$LAUNCHD_DIR" ] || LAUNCHD_DIR="/Library/LaunchDaemons"
+            ;;
+        *)
+            die "--launchd-scope must be one of: agent, daemon"
+            ;;
+    esac
+}
+
+resolve_launchd_layout
+
 # ---- Golden image -----------------------------------------------------------
 ensure_golden_image() {
     local exists=false
@@ -129,6 +167,9 @@ ensure_golden_image() {
     )
     [ -n "$RUNNER_VERSION" ] && bake_args+=(--runner-version "$RUNNER_VERSION")
     [ "$REBUILD_IMAGE" = true ] && bake_args+=(--force)
+    [ -n "$TART_GUEST_CPUS" ] && bake_args+=(--cpus "$TART_GUEST_CPUS")
+    [ -n "$TART_GUEST_MEMORY_MB" ] && bake_args+=(--memory-mb "$TART_GUEST_MEMORY_MB")
+    [ -n "$TART_GUEST_DISK_GB" ] && bake_args+=(--disk-gb "$TART_GUEST_DISK_GB")
 
     bash "$SCRIPT_DIR/tart-bake-ubuntu.sh" "${bake_args[@]}"
 }
@@ -137,10 +178,19 @@ ensure_golden_image() {
 install_launchd_service() {
     local index="$1"
     local label="${LAUNCHD_LABEL_PREFIX}-${index}"
-    local plist_dest="${LAUNCH_AGENTS_DIR}/${label}.plist"
-    local log_base="${HOME}/.github-runner-logs/tart-runner-${index}"
+    local plist_dest="${LAUNCHD_DIR}/${label}.plist"
+    local log_base="${RUNNER_HOME}/.github-runner-logs/tart-runner-${index}"
+    local user_block=""
 
-    mkdir -p "$LAUNCH_AGENTS_DIR" "${HOME}/.github-runner-logs"
+    if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+        user_block=$(cat <<EOF
+    <key>UserName</key>
+    <string>${LAUNCHD_USER}</string>
+EOF
+)
+    fi
+
+    mkdir -p "$LAUNCHD_DIR" "${RUNNER_HOME}/.github-runner-logs"
     chmod +x "$SCRIPT_DIR/tart-runner-loop.sh"
 
     # Scope flag (repo or org) passed through to the loop.
@@ -158,6 +208,8 @@ install_launchd_service() {
 <dict>
     <key>Label</key>
     <string>${label}</string>
+
+${user_block}
 
     <key>ProgramArguments</key>
     <array>
@@ -202,7 +254,7 @@ install_launchd_service() {
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>${HOME}</string>
+        <string>${RUNNER_HOME}</string>
     </dict>
 </dict>
 </plist>
@@ -210,10 +262,17 @@ EOF
 
     chmod 644 "$plist_dest"
 
-    if launchctl list "$label" >/dev/null 2>&1; then
-        launchctl unload "$plist_dest" || true
+    if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+        launchctl bootout "system/${label}" >/dev/null 2>&1 || true
+        launchctl bootstrap system "$plist_dest"
+        launchctl enable "system/${label}" >/dev/null 2>&1 || true
+    else
+        if launchctl list "$label" >/dev/null 2>&1; then
+            launchctl unload "$plist_dest" || true
+        fi
+        launchctl load "$plist_dest"
     fi
-    launchctl load "$plist_dest"
+
     log "launchd service ready: $label"
 }
 
@@ -224,6 +283,8 @@ else
     log "Target: organization $ORG"
 fi
 log "Runners: $COUNT, labels: $TART_RUNNER_LABELS, golden image: $TART_GOLDEN_IMAGE"
+log "Guest sizing: cpu=${TART_GUEST_CPUS}, mem=${TART_GUEST_MEMORY_MB}MB, disk=${TART_GUEST_DISK_GB}GB"
+log "launchd: scope=${LAUNCHD_SCOPE}, dir=${LAUNCHD_DIR}, user=${LAUNCHD_USER}"
 
 ensure_golden_image
 
@@ -234,7 +295,6 @@ for i in $(seq 1 "$COUNT"); do
         install_launchd_service "$i"
     fi
 done
-
 echo ""
 log "Provisioning complete."
 if [ "$INSTALL_LAUNCHD" = true ]; then

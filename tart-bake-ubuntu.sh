@@ -22,7 +22,8 @@
 #
 # Usage:
 #   tart-bake-ubuntu.sh [--golden-image <name>] [--base-image <ref>]
-#                       [--runner-version <x.y.z>] [--force]
+#                       [--runner-version <x.y.z>] [--cpus <n>]
+#                       [--memory-mb <mb>] [--disk-gb <gb>] [--force]
 
 set -Eeuo pipefail
 
@@ -76,6 +77,9 @@ while [ "$#" -gt 0 ]; do
         --golden-image) TART_GOLDEN_IMAGE="${2:-}"; shift 2 ;;
         --base-image) TART_BASE_IMAGE="${2:-}"; shift 2 ;;
         --runner-version) RUNNER_VERSION="${2:-}"; shift 2 ;;
+        --cpus) TART_GUEST_CPUS="${2:-}"; shift 2 ;;
+        --memory-mb) TART_GUEST_MEMORY_MB="${2:-}"; shift 2 ;;
+        --disk-gb) TART_GUEST_DISK_GB="${2:-}"; shift 2 ;;
         --force) FORCE=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown argument: $1" ;;
@@ -198,7 +202,23 @@ export DEBIAN_FRONTEND=noninteractive
 # Refresh package metadata and install the host-side tooling the runner and the
 # token loop need: curl, jq, plus cpu-checker for the kvm-ok verification.
 apt-get update -y
-apt-get install -y --no-install-recommends curl jq cpu-checker qemu-system-arm
+apt-get install -y --no-install-recommends curl wget jq cpu-checker qemu-system-arm build-essential
+
+# Install LLVM/Clang 18 via the official llvm.sh helper. This provisioning shell
+# already runs as root, so no sudo is needed; wget (installed above) is required
+# both to fetch llvm.sh and by llvm.sh itself.
+#
+# Note: llvm.sh only honours the version argument (and "all") — it ignores any
+# trailing package names, so on its own it installs just clang/clangd/lld/lldb.
+# The clang-tools-extra tooling (clang-tidy, clang-format, clang-query, …) must
+# be installed explicitly from the apt.llvm.org repo that llvm.sh configures.
+cd /tmp
+wget https://apt.llvm.org/llvm.sh
+chmod +x ./llvm.sh
+./llvm.sh 18
+cd -
+apt-get install -y --no-install-recommends \
+    clang-tools-18 clang-tidy-18 clang-format-18
 
 # Download and unpack the GitHub Actions runner (linux-arm64).
 install -d -m 0755 "$RUNNER_DIR"

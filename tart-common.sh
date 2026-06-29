@@ -54,6 +54,12 @@ TART_RUNNER_LABELS="${TART_RUNNER_LABELS:-arm64,kvm,linux,ubuntu-24.04}"
 # How long (seconds) to wait for a guest to obtain an IP / accept SSH.
 TART_BOOT_TIMEOUT="${TART_BOOT_TIMEOUT:-180}"
 
+# Failure-throttling controls for runner loops. If too many iterations fail in
+# a short window, loops can pause before retrying to avoid thrashing the host.
+TART_FAILURE_WINDOW_SEC="${TART_FAILURE_WINDOW_SEC:-600}"
+TART_FAILURE_THRESHOLD="${TART_FAILURE_THRESHOLD:-3}"
+TART_FAILURE_COOLDOWN_SEC="${TART_FAILURE_COOLDOWN_SEC:-180}"
+
 # Common SSH options: ephemeral guests have throwaway host keys, so we skip
 # host-key verification and never persist known_hosts entries.
 TART_SSH_OPTS=(
@@ -61,6 +67,9 @@ TART_SSH_OPTS=(
     -o UserKnownHostsFile=/dev/null
     -o LogLevel=ERROR
     -o ConnectTimeout=10
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
 )
 
 # -----------------------------------------------------------------------------
@@ -138,6 +147,14 @@ ssh_guest() {
         "${TART_GUEST_USER}@${ip}" "$@"
 }
 
+# Best-effort cleanup for detached `tart run ... <vm>` host processes.
+# If the guest process crashes unexpectedly, these can survive and keep a VM
+# appearing "running" even though the job loop has moved on.
+kill_tart_run_processes() {
+    local vm="$1"
+    pkill -f "no-graphics ${vm}$" 2>/dev/null || true
+}
+
 # Best-effort graceful shutdown of a guest, falling back to `tart stop`.
 stop_guest() {
     local vm="$1"
@@ -150,9 +167,13 @@ stop_guest() {
     # Give the guest a short grace period to power off on its own, then force.
     local deadline=$(( $(date +%s) + 30 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        tart list 2>/dev/null | grep -qE "[[:space:]]${vm}[[:space:]].*running" || return 0
+        if ! tart list 2>/dev/null | grep -qE "[[:space:]]${vm}[[:space:]].*running"; then
+            kill_tart_run_processes "$vm"
+            return 0
+        fi
         sleep 2
     done
 
     tart stop "$vm" 2>/dev/null || true
+    kill_tart_run_processes "$vm"
 }

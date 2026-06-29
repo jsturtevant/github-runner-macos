@@ -48,8 +48,13 @@ Optional:
   --replace                    Pass --replace to config.sh (recommended).
   --force-recreate             Delete existing runner directories before install.
   --install-launchd            Install/reload launchd services for all 1..N runners.
+    --launchd-scope <scope>      launchd scope: agent|daemon. Default: agent.
+    --launchd-user <user>        User account for daemon scope. Default: current user.
+    --launchd-dir <dir>          Directory for plist files.
+                                                             Defaults: ~/Library/LaunchAgents (agent),
+                                                                                 /Library/LaunchDaemons (daemon).
   --launchd-label-prefix <p>   launchd label prefix. Default: com.github.runner.
-  --launch-agents-dir <dir>    LaunchAgents directory. Default: ~/Library/LaunchAgents.
+    --launch-agents-dir <dir>    Back-compat alias for --launchd-dir.
   --version <x.y.z>            Runner version. Default: latest release.
   -h, --help                   Show this help.
 EOF
@@ -87,10 +92,19 @@ install_launchd_service() {
     local runner_index="$1"
     local runner_dir="$2"
     local label="${LAUNCHD_LABEL_PREFIX}-${runner_index}"
-    local plist_dest="${LAUNCH_AGENTS_DIR}/${label}.plist"
-    local log_base="${HOME}/.github-runner-logs/runner-${runner_index}"
+    local plist_dest="${LAUNCHD_DIR}/${label}.plist"
+    local log_base="${RUNNER_HOME}/.github-runner-logs/runner-${runner_index}"
+    local user_block=""
 
-    mkdir -p "$LAUNCH_AGENTS_DIR" "${HOME}/.github-runner-logs"
+    if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+        user_block=$(cat <<EOF
+    <key>UserName</key>
+    <string>${LAUNCHD_USER}</string>
+EOF
+)
+    fi
+
+    mkdir -p "$LAUNCHD_DIR" "${RUNNER_HOME}/.github-runner-logs"
     chmod +x "$SCRIPT_DIR/github-runner-wrapper.sh"
 
     cat > "$plist_dest" <<EOF
@@ -100,6 +114,8 @@ install_launchd_service() {
 <dict>
     <key>Label</key>
     <string>${label}</string>
+
+${user_block}
 
     <key>ProgramArguments</key>
     <array>
@@ -131,7 +147,13 @@ install_launchd_service() {
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>${HOME}</string>
+        <string>${RUNNER_HOME}</string>
+        <key>GH_WRAPPER_FAILURE_WINDOW_SEC</key>
+        <string>600</string>
+        <key>GH_WRAPPER_FAILURE_THRESHOLD</key>
+        <string>5</string>
+        <key>GH_WRAPPER_FAILURE_COOLDOWN_SEC</key>
+        <string>180</string>
     </dict>
 </dict>
 </plist>
@@ -139,11 +161,17 @@ EOF
 
     chmod 644 "$plist_dest"
 
-    if launchctl list "$label" >/dev/null 2>&1; then
-        launchctl unload "$plist_dest" || true
+    if [ "$LAUNCHD_SCOPE" = "daemon" ]; then
+        launchctl bootout "system/${label}" >/dev/null 2>&1 || true
+        launchctl bootstrap system "$plist_dest"
+        launchctl enable "system/${label}" >/dev/null 2>&1 || true
+    else
+        if launchctl list "$label" >/dev/null 2>&1; then
+            launchctl unload "$plist_dest" || true
+        fi
+        launchctl load "$plist_dest"
     fi
 
-    launchctl load "$plist_dest"
     echo "launchd service ready: $label"
 }
 
@@ -162,7 +190,10 @@ FORCE_RECREATE=false
 VERSION=""
 INSTALL_LAUNCHD=false
 LAUNCHD_LABEL_PREFIX="com.github.runner"
-LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+LAUNCHD_SCOPE="agent"
+LAUNCHD_USER="${SUDO_USER:-$USER}"
+LAUNCHD_DIR=""
+RUNNER_HOME=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -222,12 +253,24 @@ while [ "$#" -gt 0 ]; do
             INSTALL_LAUNCHD=true
             shift
             ;;
+        --launchd-scope)
+            LAUNCHD_SCOPE="${2:-}"
+            shift 2
+            ;;
+        --launchd-user)
+            LAUNCHD_USER="${2:-}"
+            shift 2
+            ;;
+        --launchd-dir)
+            LAUNCHD_DIR="${2:-}"
+            shift 2
+            ;;
         --launchd-label-prefix)
             LAUNCHD_LABEL_PREFIX="${2:-}"
             shift 2
             ;;
         --launch-agents-dir)
-            LAUNCH_AGENTS_DIR="${2:-}"
+            LAUNCHD_DIR="${2:-}"
             shift 2
             ;;
         -h|--help)
@@ -282,6 +325,30 @@ elif [ -n "$ORG" ]; then
     TARGET_URL="https://github.com/$ORG"
 fi
 
+resolve_launchd_layout() {
+    case "$LAUNCHD_SCOPE" in
+        agent)
+            RUNNER_HOME="$HOME"
+            [ -n "$LAUNCHD_DIR" ] || LAUNCHD_DIR="$HOME/Library/LaunchAgents"
+            ;;
+        daemon)
+            [ "$(id -u)" -eq 0 ] || { echo "ERROR: --launchd-scope daemon requires root. Re-run with sudo."; exit 1; }
+            [ -n "$LAUNCHD_USER" ] || { echo "ERROR: --launchd-user is required for daemon scope."; exit 1; }
+            RUNNER_HOME="$(dscl . -read "/Users/${LAUNCHD_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+            [ -n "$RUNNER_HOME" ] || RUNNER_HOME="/Users/${LAUNCHD_USER}"
+            [ -n "$LAUNCHD_DIR" ] || LAUNCHD_DIR="/Library/LaunchDaemons"
+            ;;
+        *)
+            echo "ERROR: --launchd-scope must be one of: agent, daemon"
+            exit 1
+            ;;
+    esac
+}
+
+if [ "$INSTALL_LAUNCHD" = true ]; then
+    resolve_launchd_layout
+fi
+
 for cmd in curl tar; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "ERROR: Required command not found: $cmd"
@@ -319,6 +386,9 @@ trap cleanup_tmp EXIT
 
 echo "Using target URL: $TARGET_URL"
 echo "Using runner version: $VERSION"
+if [ "$INSTALL_LAUNCHD" = true ]; then
+    echo "launchd: scope=${LAUNCHD_SCOPE}, dir=${LAUNCHD_DIR}, user=${LAUNCHD_USER}"
+fi
 echo "Downloading: $DOWNLOAD_URL"
 curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_NAME"
 

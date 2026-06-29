@@ -71,35 +71,39 @@ Important:
 
 ## 2) One Command: Bootstrap + Hook Env + launchd
 
-Organization example:
+Recommended (LaunchDaemon mode, starts at boot without login):
 
 ```bash
-bash bootstrap-gh-runners.sh \
+sudo bash bootstrap-gh-runners.sh \
   --dir-prefix "$HOME/github-runner" \
-  --count 2 \
+  --count 3 \
   --org your-org \
   --token "YOUR_REGISTRATION_TOKEN" \
   --labels "self-hosted,macos,arm64" \
   --replace \
-  --install-launchd
+  --install-launchd \
+  --launchd-scope daemon \
+  --launchd-user "$USER"
 ```
 
-Repository example:
+User based (LaunchAgent mode, starts after user login):
 
 ```bash
 bash bootstrap-gh-runners.sh \
   --dir-prefix "$HOME/github-runner" \
-  --count 2 \
+  --count 3 \
   --repo owner/repo \
   --token "YOUR_REGISTRATION_TOKEN" \
   --labels "self-hosted,macos,arm64" \
   --replace \
-  --install-launchd
+  --install-launchd \
+  --launchd-scope agent
 ```
 
 What this creates:
 - $HOME/github-runner-1
 - $HOME/github-runner-2
+- $HOME/github-runner-3
 
 Common flags:
 - --runner-group <name>: Org or enterprise runner group.
@@ -107,63 +111,107 @@ Common flags:
 - --token-file <path>: Read the registration token from a file instead of `--token` (keeps the secret out of shell history and the process list).
 - --force-recreate: Deletes existing directories before reinstall.
 - --install-launchd: Installs/reloads launchd services for all runners 1..N.
+- --launchd-scope <agent|daemon>: launchd domain (`agent` requires login, `daemon` starts at boot).
+- --launchd-user <user>: account used by daemon mode (`UserName` in plist).
+- --launchd-dir <dir>: launchd plist directory override.
 - --launchd-label-prefix <prefix>: Custom launchd label prefix (default: com.github.runner).
-- --launch-agents-dir <dir>: Custom LaunchAgents directory (default: ~/Library/LaunchAgents).
+- --launch-agents-dir <dir>: Back-compat alias for `--launchd-dir`.
 - --version x.y.z: Pins runner version instead of latest.
 
 Incremental behavior:
-- If prefix-1 and prefix-2 already exist and are configured, and you run with --count 4, the script skips 1/2 and sets up 3/4.
+- If prefix-1 and prefix-2 already exist and are configured, and you run with --count 3, the script skips existing configured directories and ensures services 1..3 are installed/reloaded.
 - It also ensures ACTIONS_RUNNER_HOOK_JOB_COMPLETED is present in each runner .env and writes job-completed-hook.sh.
-- With --install-launchd, it installs/reloads services com.github.runner-1 .. com.github.runner-4.
 
 ## 3) Verify
+
+LaunchDaemon mode:
+
+```bash
+for i in 1 2 3; do
+  sudo launchctl print system/com.github.runner-${i} >/dev/null 2>&1 \
+    && echo "runner-${i}: loaded" \
+    || echo "runner-${i}: missing"
+done
+```
+
+LaunchAgent mode:
 
 ```bash
 launchctl list com.github.runner-1
 launchctl list com.github.runner-2
-```
-
-If you used count 4, also check:
-
-```bash
 launchctl list com.github.runner-3
-launchctl list com.github.runner-4
 ```
 
 Expected in runner terminal/logs after startup:
 - Connected to GitHub
 - Listening for Jobs
 
-## Logs
+## OPS (macOS / AVF runners)
+
+LaunchDaemon mode:
 
 ```bash
-tail -f ~/.github-runner-logs/runner-1-*.log
-tail -f ~/.github-runner-logs/runner-2-*.log
+# Status summary
+for i in 1 2 3; do
+  sudo launchctl print system/com.github.runner-${i} >/dev/null 2>&1 \
+    && echo "runner-${i}: loaded" \
+    || echo "runner-${i}: missing"
+done
+
+# Full status for one runner
+sudo launchctl print system/com.github.runner-1
+
+# Tail logs
+tail -f ~/.github-runner-logs/runner-1-stdout.log
+tail -f ~/.github-runner-logs/runner-1-stderr.log
 tail -f ~/github-runner-1/.cleanup.log
-tail -f ~/github-runner-2/.cleanup.log
+
+# Tail all three stdout logs
+tail -f ~/.github-runner-logs/runner-1-stdout.log \
+        ~/.github-runner-logs/runner-2-stdout.log \
+        ~/.github-runner-logs/runner-3-stdout.log
+
+# Stop one runner
+sudo launchctl bootout system/com.github.runner-1 || true
+
+# Start one runner
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-1.plist
+
+# Restart all three runners
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.runner-${i} || true
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.runner-${i}.plist
+done
+
+# Stop all three
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.runner-${i} || true
+done
+
+# Uninstall daemon services
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.runner-${i} || true
+  sudo rm -f /Library/LaunchDaemons/com.github.runner-${i}.plist
+done
 ```
 
-## Restart / Stop / Uninstall
-
-Restart runners (example for 1..4):
+LaunchAgent mode:
 
 ```bash
-for i in 1 2 3 4; do
+for i in 1 2 3; do
   launchctl unload ~/Library/LaunchAgents/com.github.runner-${i}.plist || true
-done
-for i in 1 2 3 4; do
-  launchctl load ~/Library/LaunchAgents/com.github.runner-${i}.plist
+  launchctl load   ~/Library/LaunchAgents/com.github.runner-${i}.plist
 done
 ```
 
-Remove launchd services for arbitrary 1..N (example for 1..4):
-
-```bash
-for i in 1 2 3 4; do
-  launchctl unload ~/Library/LaunchAgents/com.github.runner-${i}.plist || true
-  rm -f ~/Library/LaunchAgents/com.github.runner-${i}.plist
-done
-```
+Notes:
+- LaunchDaemon mode is resilient to reboot without login.
+- LaunchAgent mode requires user login after reboot.
+- The wrapper includes a failure circuit breaker to avoid tight crash loops:
+  default threshold=5 failures in 600s, cooldown=180s, then automatic resume.
+- Tune via launchd environment variables:
+  `GH_WRAPPER_FAILURE_THRESHOLD`, `GH_WRAPPER_FAILURE_WINDOW_SEC`,
+  `GH_WRAPPER_FAILURE_COOLDOWN_SEC`.
 
 Remove runner registration from GitHub:
 - Use the Remove flow in GitHub Settings -> Actions -> Runners for each runner.
@@ -261,7 +309,8 @@ it explicitly:
 
 ```bash
 bash tart-bake-ubuntu.sh
-# options: --golden-image <name> --base-image <ref> --runner-version <x.y.z> --force
+# options: --golden-image <name> --base-image <ref> --runner-version <x.y.z>
+#          --cpus <n> --memory-mb <mb> --disk-gb <gb> --force
 ```
 
 This:
@@ -276,7 +325,25 @@ This:
 > credentials. They are used **only once** during the bake to inject our key;
 > password authentication is then turned off inside the golden image.
 
-## 3) One command: bootstrap + launchd
+## 3) One command: bootstrap + launchd (LaunchDaemon recommended)
+
+Recommended (system LaunchDaemons, survives reboot without login):
+
+```bash
+sudo bash bootstrap-tart-runners.sh \
+  --count 3 \
+  --org your-org \
+  --app-id 123456 \
+  --private-key "$HOME/.config/github-runner-tart/app.private-key.pem" \
+  --cpus 2 \
+  --memory-mb 4096 \
+  --disk-gb 50 \
+  --install-launchd \
+  --launchd-scope daemon \
+  --launchd-user "$USER"
+```
+
+Interactive-user mode (LaunchAgents; starts after user login):
 
 Repository target:
 
@@ -317,18 +384,70 @@ Common flags:
 - `--golden-image <name>`: golden image name (default `gha-ubuntu-kvm`).
 - `--base-image <ref>`: base OCI image (default `ghcr.io/cirruslabs/ubuntu:latest`).
 - `--runner-version <x.y.z>`: pin the Actions runner version baked in.
+- `--cpus <n>`: set guest vCPU count in the baked image.
+- `--memory-mb <mb>`: set guest RAM in MB in the baked image.
+- `--disk-gb <gb>`: set guest disk size in GB in the baked image.
 - `--labels <csv>`: override runner labels.
 - `--name-prefix <prefix>`: runner name prefix (default `tart-ubuntu`).
 - `--rebuild-image`: force a rebuild of the golden image.
 - `--install-launchd`: install/reload a launchd service per runner.
+- `--launchd-scope <agent|daemon>`: choose LaunchAgent (user login required) or LaunchDaemon (starts at boot).
+- `--launchd-user <user>`: account used by daemon scope (sets `UserName` in plist).
+- `--launchd-dir <dir>`: plist directory override.
 - `--launchd-label-prefix <p>`: launchd label prefix (default `com.github.tart-runner`).
 
+Hardening defaults (in `tart-common.sh`):
+- SSH keepalive/fail-fast to avoid stuck loops after dead guests.
+- Automatic cleanup of stale host-side `tart run` processes.
+- Failure circuit breaker: if a runner sees repeated failures (default: 3 in 600s), it cools down for 180s, then resumes automatically.
+
+Sizing guidance for this class of host (Apple Silicon, 16 GB RAM):
+- 2 runners: `--cpus 4 --memory-mb 8192`.
+- 3 runners (recommended): `--cpus 2 --memory-mb 4096`.
+- 4 runners: only for light workloads; nested-virt jobs may become unstable.
+
 ## 4) Verify
+
+LaunchDaemon mode:
+
+```bash
+sudo launchctl print system/com.github.tart-runner-1
+sudo launchctl print system/com.github.tart-runner-2
+sudo launchctl print system/com.github.tart-runner-3
+tail -f ~/.github-runner-logs/tart-runner-1-stdout.log
+```
+
+Daemon ops cheat sheet:
+
+```bash
+# Status (all configured Tart runner daemons)
+for i in 1 2 3; do
+  sudo launchctl print system/com.github.tart-runner-${i} >/dev/null 2>&1 \
+    && echo "runner-${i}: loaded" \
+    || echo "runner-${i}: missing"
+done
+
+# Full status dump for one daemon
+sudo launchctl print system/com.github.tart-runner-1
+
+# Tail stdout/stderr for one runner
+tail -f ~/.github-runner-logs/tart-runner-1-stdout.log
+tail -f ~/.github-runner-logs/tart-runner-1-stderr.log
+
+# Tail all runner stdout logs together
+tail -f ~/.github-runner-logs/tart-runner-1-stdout.log \
+        ~/.github-runner-logs/tart-runner-2-stdout.log \
+        ~/.github-runner-logs/tart-runner-3-stdout.log
+
+# Show current VM state (golden + active clones)
+tart list | grep -E 'gha-ubuntu-kvm|gha-ubuntu-kvm-runner-'
+```
+
+LaunchAgent mode:
 
 ```bash
 launchctl list com.github.tart-runner-1
 launchctl list com.github.tart-runner-2
-tail -f ~/.github-runner-logs/tart-runner-1-*.log
 ```
 
 You should see clone → boot → "Listening for Jobs" → teardown on each cycle. In
@@ -350,21 +469,44 @@ bash tart-runner-loop.sh \
 
 ## Restart / Stop / Uninstall (Ubuntu / KVM runners)
 
+LaunchDaemon mode:
+
 ```bash
-# Restart runners 1..N (example 1..2)
-for i in 1 2; do
-  launchctl unload ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist || true
-  launchctl load   ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist
+# Stop one runner daemon
+sudo launchctl bootout system/com.github.tart-runner-1
+
+# Start one runner daemon
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-1.plist
+
+# Restart runners 1..N (example 1..3)
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.tart-runner-${i} || true
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.tart-runner-${i}.plist
+done
+
+# Optional: stop/delete stale runner clone VMs before restart
+for i in 1 2 3; do
+  tart stop gha-ubuntu-kvm-runner-${i} 2>/dev/null || true
+  tart delete gha-ubuntu-kvm-runner-${i} 2>/dev/null || true
 done
 
 # Remove services 1..N
-for i in 1 2; do
-  launchctl unload ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist || true
-  rm -f ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist
+for i in 1 2 3; do
+  sudo launchctl bootout system/com.github.tart-runner-${i} || true
+  sudo rm -f /Library/LaunchDaemons/com.github.tart-runner-${i}.plist
 done
 
 # Remove the golden image entirely
 tart delete gha-ubuntu-kvm
+```
+
+LaunchAgent mode:
+
+```bash
+for i in 1 2; do
+  launchctl unload ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist || true
+  rm -f ~/Library/LaunchAgents/com.github.tart-runner-${i}.plist
+done
 ```
 
 Ephemeral runners deregister themselves automatically (they are configured with

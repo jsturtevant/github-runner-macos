@@ -22,6 +22,12 @@ RESTART_DELAY=5  # seconds to wait between restart attempts
 LOG_DIR="${HOME}/.github-runner-logs"
 LOG_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").log"
 PID_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").pid"
+FAILURE_STATE_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").failure-epochs"
+
+# Circuit-breaker controls (override via environment in launchd plist if needed).
+FAILURE_WINDOW_SEC="${GH_WRAPPER_FAILURE_WINDOW_SEC:-600}"
+FAILURE_THRESHOLD="${GH_WRAPPER_FAILURE_THRESHOLD:-5}"
+FAILURE_COOLDOWN_SEC="${GH_WRAPPER_FAILURE_COOLDOWN_SEC:-180}"
 
 # Setup logging
 mkdir -p "$LOG_DIR"
@@ -46,6 +52,28 @@ cleanup() {
 
 trap cleanup EXIT
 
+clear_failure_history() {
+    rm -f "$FAILURE_STATE_FILE" 2>/dev/null || true
+}
+
+record_failure_and_maybe_cooldown() {
+    local now cutoff failures
+
+    now="$(date +%s)"
+    cutoff=$(( now - FAILURE_WINDOW_SEC ))
+
+    printf '%s\n' "$now" >> "$FAILURE_STATE_FILE"
+    awk -v cutoff="$cutoff" '$1 >= cutoff' "$FAILURE_STATE_FILE" > "${FAILURE_STATE_FILE}.tmp" || true
+    mv -f "${FAILURE_STATE_FILE}.tmp" "$FAILURE_STATE_FILE"
+
+    failures="$(wc -l < "$FAILURE_STATE_FILE" | tr -d ' ')"
+    if [ "$failures" -ge "$FAILURE_THRESHOLD" ]; then
+        log "WARN" "Circuit breaker: ${failures} failures in ${FAILURE_WINDOW_SEC}s; cooling down ${FAILURE_COOLDOWN_SEC}s"
+        sleep "$FAILURE_COOLDOWN_SEC"
+        clear_failure_history
+    fi
+}
+
 # Track the current runner child so the SIGTERM handler can stop it cleanly.
 run_pid=""
 
@@ -65,6 +93,7 @@ trap handle_sigterm SIGTERM
 log "INFO" "Starting GitHub Actions runner wrapper"
 log "INFO" "Runner directory: $RUNNER_DIR"
 log "INFO" "Restart delay: ${RESTART_DELAY}s"
+log "INFO" "Failure window/throttle: threshold=${FAILURE_THRESHOLD}, window=${FAILURE_WINDOW_SEC}s, cooldown=${FAILURE_COOLDOWN_SEC}s"
 log "INFO" "Note: Post-job cleanup is handled via ACTIONS_RUNNER_HOOK_JOB_COMPLETED in .env"
 
 # Verify runner directory exists
@@ -102,6 +131,12 @@ while true; do
     run_pid=""
 
     log "WARN" "Runner exited with code $run_exit_code"
+
+    if [ "$run_exit_code" -eq 0 ]; then
+        clear_failure_history
+    else
+        record_failure_and_maybe_cooldown
+    fi
 
     # Interruptible back-off: background the sleep and wait on it so a SIGTERM
     # breaks us out immediately via the trap instead of blocking the delay.
