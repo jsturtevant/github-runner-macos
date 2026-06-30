@@ -401,10 +401,35 @@ Hardening defaults (in `tart-common.sh`):
 - Automatic cleanup of stale host-side `tart run` processes.
 - Failure circuit breaker: if a runner sees repeated failures (default: 3 in 600s), it cools down for 180s, then resumes automatically.
 
-Sizing guidance for this class of host (Apple Silicon, 16 GB RAM):
-- 2 runners: `--cpus 4 --memory-mb 8192`.
-- 3 runners (recommended): `--cpus 2 --memory-mb 4096`.
-- 4 runners: only for light workloads; nested-virt jobs may become unstable.
+### Persistent build cache (virtio-fs)
+
+Each ephemeral guest is destroyed after one job, so without help every job
+rebuilds from scratch. To keep compiler/dependency caches warm, the runner loop
+shares a **persistent host directory into every guest over virtio-fs**:
+
+- Host side: `~/.cache/github-runner-tart/runner-<N>/` (override the root with
+  `TART_CACHE_DIR`). The bootstrap script pre-creates it and bakes the path into
+  each launchd plist. It is shared in via `tart run --dir=ci-cache:<path>`.
+- Guest side: Apple's Virtualization framework exposes every `--dir` share under
+  a single automount tag (`com.apple.virtio-fs.automount`), with each named
+  share as a sub-directory. The loop mounts that tag at `/var/cache/ci`, so the
+  cache lives at `/var/cache/ci/ci-cache/` (best-effort; a mount failure is
+  non-fatal and never fails the job). `SCCACHE_DIR=/var/cache/ci/ci-cache/sccache`
+  and `SCCACHE_CACHE_SIZE` are exported into the runner environment, so once a
+  workflow enables [sccache](https://github.com/mozilla/sccache) the cache is
+  automatically persistent and **network-free** — no GitHub cache upload/download.
+
+This is transparent to the workflow YAML: jobs just see a populated
+`SCCACHE_DIR`. It complements (does not replace) `Swatinem/rust-cache`; it
+deliberately only provides the sccache layer to avoid fighting that action over
+`CARGO_HOME`/`target`.
+
+**Concurrency (multiple runners):** each runner index gets its **own** cache
+sub-directory (`runner-<N>`), so two runners never write to the same cache dir.
+This is intentional — sccache/cargo are not safe with multiple independent
+writers sharing one directory over virtio-fs, so per-runner dirs avoid cache
+corruption at the cost of a little disk and a lower cross-runner hit rate. Tune
+the cap with `TART_CACHE_MAX_SIZE` (default `20G`).
 
 ## 4) Verify
 
@@ -513,6 +538,55 @@ Ephemeral runners deregister themselves automatically (they are configured with
 `--ephemeral`), so there's normally nothing to clean up in the GitHub UI.
 
 ## Troubleshooting
+
+- **Quick monitor workflow (auto snapshot on first crash):**
+
+  ```bash
+  # Watch all 3 runners; on first error marker it auto-captures and exits.
+  ./monitor-tart-debug.sh auto all 200
+  
+  # Same, but only for runner 1.
+  ./monitor-tart-debug.sh auto 1 200
+  ```
+
+  The last number (`200`) is the number of lines per log section included in
+  the generated snapshot file. Use a larger value for more context, or a
+  smaller value for shorter snapshots.
+
+  Other modes:
+
+  ```bash
+  # Continuous live stream (manual Ctrl+C)
+  ./monitor-tart-debug.sh watch all
+
+  # One-shot dump right now (returns immediately)
+  ./monitor-tart-debug.sh snapshot all 200
+  ```
+
+- **`VZErrorDomain Code=1` / "The virtual machine stopped unexpectedly":** this means the guest process crashed at the Apple Virtualization layer (host-side), not just a workflow failure inside Linux.
+  Enable deep diagnostics and keep failed clones by reinstalling the launchd services with:
+
+  ```bash
+  TART_RUNNER_DEBUG=1 \
+  TART_KEEP_FAILED_VM=1 \
+  TART_VM_LOG_LOOKBACK_MINUTES=15 \
+  sudo bash bootstrap-tart-runners.sh \
+    --count 3 \
+    --org your-org \
+    --app-id 123456 \
+    --private-key "$HOME/.config/github-runner-tart/app.private-key.pem" \
+    --install-launchd \
+    --launchd-scope daemon \
+    --launchd-user "$USER"
+  ```
+
+  Then inspect:
+  - `~/.github-runner-logs/tart-runner-<n>-stdout.log` (loop flow)
+  - `~/.github-runner-logs/tart-runner-<n>-vm-*.log` (raw `tart run` output, includes VZ errors)
+  - `~/.github-runner-logs/tart-runner-<n>-vm-diagnostics.log` (host `log show` extract for Tart/Virtualization)
+  - `~/.github-runner-logs/tart-runner-<n>-trace.log` (bash xtrace when debug is enabled)
+
+  With `TART_KEEP_FAILED_VM=1`, failed clones are not deleted, so you can inspect their state with `tart list` and `tart get <vm-name>`.
 
 - **`/dev/kvm` missing / bake fails at `kvm-ok`:** the host isn't M3/M4 on
   macOS 15+, or Tart was started without `--nested`. Nested virt is not

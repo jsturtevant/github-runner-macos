@@ -47,8 +47,8 @@ Optional:
   --golden-image <name>    Golden image name. Default: gha-ubuntu-kvm.
   --base-image <ref>       Base OCI image. Default: ghcr.io/cirruslabs/ubuntu:latest.
   --runner-version <x.y.z> Actions runner version baked in. Default: latest.
-    --cpus <n>               Guest vCPUs in the baked image. Default: 4.
-    --memory-mb <mb>         Guest RAM in MB in the baked image. Default: 8192.
+    --cpus <n>               Guest vCPUs in the baked image. Default: 2.
+    --memory-mb <mb>         Guest RAM in MB in the baked image. Default: 4096.
     --disk-gb <gb>           Guest disk size in GB in the baked image. Default: 50.
   --labels <csv>           Runner labels. Default: arm64,kvm,linux,ubuntu-24.04.
   --name-prefix <prefix>   Runner name prefix. Default: tart-ubuntu.
@@ -79,6 +79,9 @@ LAUNCHD_SCOPE="agent"
 LAUNCHD_USER="${SUDO_USER:-$USER}"
 LAUNCHD_DIR=""
 RUNNER_HOME=""
+RUNNER_DEBUG_MODE="${TART_RUNNER_DEBUG:-0}"
+KEEP_FAILED_VM_MODE="${TART_KEEP_FAILED_VM:-0}"
+VM_LOG_LOOKBACK_MINUTES="${TART_VM_LOG_LOOKBACK_MINUTES:-10}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -149,6 +152,17 @@ resolve_launchd_layout() {
 }
 
 resolve_launchd_layout
+
+# Persistent host cache root shared into the guests. Resolve it now (honouring
+# an explicit TART_CACHE_DIR) so the value baked into each launchd plist matches
+# what the loop would compute, and pre-create it.
+CACHE_DIR_VALUE="${TART_CACHE_DIR:-$RUNNER_HOME/.cache/github-runner-tart}"
+mkdir -p "$CACHE_DIR_VALUE"
+# In daemon scope the loop runs as LAUNCHD_USER, but bootstrap runs as root, so
+# hand ownership of the cache root to that user or the loop can't write to it.
+if [ "$LAUNCHD_SCOPE" = "daemon" ] && [ "$(id -u)" -eq 0 ]; then
+    chown -R "$LAUNCHD_USER" "$CACHE_DIR_VALUE" 2>/dev/null || true
+fi
 
 # ---- Golden image -----------------------------------------------------------
 ensure_golden_image() {
@@ -255,6 +269,14 @@ ${user_block}
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>${RUNNER_HOME}</string>
+        <key>TART_RUNNER_DEBUG</key>
+        <string>${RUNNER_DEBUG_MODE}</string>
+        <key>TART_KEEP_FAILED_VM</key>
+        <string>${KEEP_FAILED_VM_MODE}</string>
+        <key>TART_VM_LOG_LOOKBACK_MINUTES</key>
+        <string>${VM_LOG_LOOKBACK_MINUTES}</string>
+        <key>TART_CACHE_DIR</key>
+        <string>${CACHE_DIR_VALUE}</string>
     </dict>
 </dict>
 </plist>
@@ -285,6 +307,7 @@ fi
 log "Runners: $COUNT, labels: $TART_RUNNER_LABELS, golden image: $TART_GOLDEN_IMAGE"
 log "Guest sizing: cpu=${TART_GUEST_CPUS}, mem=${TART_GUEST_MEMORY_MB}MB, disk=${TART_GUEST_DISK_GB}GB"
 log "launchd: scope=${LAUNCHD_SCOPE}, dir=${LAUNCHD_DIR}, user=${LAUNCHD_USER}"
+log "launchd debug: TART_RUNNER_DEBUG=${RUNNER_DEBUG_MODE}, TART_KEEP_FAILED_VM=${KEEP_FAILED_VM_MODE}, TART_VM_LOG_LOOKBACK_MINUTES=${VM_LOG_LOOKBACK_MINUTES}"
 
 ensure_golden_image
 

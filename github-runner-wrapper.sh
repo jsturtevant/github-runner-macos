@@ -14,7 +14,7 @@
 #
 # Install as a launchd service via the corresponding .plist file.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # Config
 RUNNER_DIR="${1:?Error: runner directory required (e.g., \$HOME/github-runner-1)}"
@@ -23,6 +23,8 @@ LOG_DIR="${HOME}/.github-runner-logs"
 LOG_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").log"
 PID_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").pid"
 FAILURE_STATE_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").failure-epochs"
+TRACE_FILE="${LOG_DIR}/runner-$(basename "$RUNNER_DIR").trace.log"
+DEBUG_MODE="${GH_WRAPPER_DEBUG:-0}"
 
 # Circuit-breaker controls (override via environment in launchd plist if needed).
 FAILURE_WINDOW_SEC="${GH_WRAPPER_FAILURE_WINDOW_SEC:-600}"
@@ -42,6 +44,25 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "$LOG_FILE"
 }
 
+enable_debug_trace() {
+    [ "$DEBUG_MODE" = "1" ] || return 0
+
+    # Route xtrace output to a dedicated log file, keeping runner output clean.
+    # shellcheck disable=SC2034
+    PS4='+ [${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]-main}] '
+    exec 9>>"$TRACE_FILE"
+    export BASH_XTRACEFD=9
+    set -x
+    log "INFO" "Debug tracing enabled: $TRACE_FILE"
+}
+
+handle_err() {
+    local exit_code="$1"
+    local line_no="$2"
+    local cmd="$3"
+    log "ERROR" "Command failed (exit=${exit_code}) at line ${line_no}: ${cmd}"
+}
+
 # Cleanup on exit
 cleanup() {
     local exit_code=$?
@@ -51,6 +72,7 @@ cleanup() {
 }
 
 trap cleanup EXIT
+trap 'handle_err $? ${LINENO} "${BASH_COMMAND}"' ERR
 
 clear_failure_history() {
     rm -f "$FAILURE_STATE_FILE" 2>/dev/null || true
@@ -95,6 +117,7 @@ log "INFO" "Runner directory: $RUNNER_DIR"
 log "INFO" "Restart delay: ${RESTART_DELAY}s"
 log "INFO" "Failure window/throttle: threshold=${FAILURE_THRESHOLD}, window=${FAILURE_WINDOW_SEC}s, cooldown=${FAILURE_COOLDOWN_SEC}s"
 log "INFO" "Note: Post-job cleanup is handled via ACTIONS_RUNNER_HOOK_JOB_COMPLETED in .env"
+enable_debug_trace
 
 # Verify runner directory exists
 if [ ! -d "$RUNNER_DIR" ]; then

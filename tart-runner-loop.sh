@@ -27,7 +27,7 @@
 #   --name-prefix                   Runner name prefix (default: tart-ubuntu)
 #   --labels                        Comma-separated labels (default from common)
 
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tart-common.sh
@@ -86,6 +86,49 @@ fi
 # so leftover clones from a crash are reclaimed on the next pass.
 CLONE_NAME="${TART_GOLDEN_IMAGE}-runner-${INDEX}"
 FAILURE_STATE_FILE="${TART_CONFIG_DIR}/runner-${INDEX}.failure-epochs"
+RUNNER_LABEL="tart-runner-${INDEX}"
+# Per-runner persistent host cache dir (see tart-common.sh for the concurrency
+# rationale). Shared into the guest read-write over virtio-fs each job.
+HOST_CACHE_DIR="${TART_CACHE_DIR}/runner-${INDEX}"
+
+# Per-job context banner. Wired into each guest via ACTIONS_RUNNER_HOOK_JOB_STARTED
+# so every job logs which repo / PR / run / actor it is serving. The runner
+# streams this to run.sh's stdout, which flows back over SSH into this host's
+# launchd stdout log — so with several PRs in flight you can tell exactly which
+# one each runner is working on. Encoded to base64 to inject cleanly over SSH.
+GUEST_HOOK_PATH="${TART_GUEST_RUNNER_DIR}/job-started-hook.sh"
+# Written to a temp file via a plain heredoc redirection (not command
+# substitution) so it parses under macOS /bin/bash 3.2, then base64-encoded for
+# clean injection over SSH.
+_hook_tmp="$(mktemp)"
+cat > "$_hook_tmp" <<'HOOK'
+#!/usr/bin/env bash
+{
+  echo "==================== JOB CONTEXT ===================="
+  echo "repo:     ${GITHUB_REPOSITORY:-?}"
+  echo "workflow: ${GITHUB_WORKFLOW:-?}  |  job: ${GITHUB_JOB:-?}"
+  echo "event:    ${GITHUB_EVENT_NAME:-?}"
+  case "${GITHUB_REF:-}" in
+    refs/pull/*) n="${GITHUB_REF#refs/pull/}"; n="${n%%/*}";
+      echo "PR:       #${n}  ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/pull/${n}";;
+  esac
+  [ -n "${GITHUB_HEAD_REF:-}" ] && echo "branch:   ${GITHUB_HEAD_REF} -> ${GITHUB_BASE_REF:-?}"
+  echo "actor:    ${GITHUB_ACTOR:-?} (trigger: ${GITHUB_TRIGGERING_ACTOR:-?})"
+  echo "sha:      ${GITHUB_SHA:-?}"
+  echo "run:      ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-?} (attempt ${GITHUB_RUN_ATTEMPT:-?})"
+  if command -v jq >/dev/null 2>&1 && [ -f "${GITHUB_EVENT_PATH:-/nonexistent}" ]; then
+    t="$(jq -r '.pull_request.title // .head_commit.message // empty' "$GITHUB_EVENT_PATH" 2>/dev/null | head -n1)"
+    [ -n "$t" ] && echo "title:    $t"
+  fi
+  echo "===================================================="
+} 2>/dev/null
+exit 0
+HOOK
+JOB_STARTED_HOOK_B64="$(base64 < "$_hook_tmp" | tr -d '\n')"
+rm -f "$_hook_tmp"
+
+enable_debug_trace "$RUNNER_LABEL"
+install_err_diagnostics "runner ${INDEX}"
 
 # Clear failure history after a successful job so only fresh incidents count.
 clear_failure_history() {
@@ -124,43 +167,118 @@ delete_clone_if_present() {
 run_one_job() {
     delete_clone_if_present
 
+    mkdir -p "$TART_DEBUG_LOG_DIR"
+    local iter_ts vm_runtime_log run_failed fail_reason
+    iter_ts="$(date '+%Y%m%d-%H%M%S')"
+    vm_runtime_log="${TART_DEBUG_LOG_DIR}/${RUNNER_LABEL}-vm-${iter_ts}.log"
+    run_failed=0
+    fail_reason=""
+
     log "[runner ${INDEX}] Cloning ${TART_GOLDEN_IMAGE} -> ${CLONE_NAME}"
     tart clone "$TART_GOLDEN_IMAGE" "$CLONE_NAME"
 
+    # Ensure the per-runner host cache dir exists before sharing it in.
+    # Non-fatal: caching is an optimization, never a reason to fail a job.
+    mkdir -p "${HOST_CACHE_DIR}/sccache" 2>/dev/null || true
+
     log "[runner ${INDEX}] Booting ephemeral guest with nested virtualization"
-    tart run --nested --no-graphics "$CLONE_NAME" &
+    # Only share the cache into the guest if the host dir actually exists, so a
+    # cache problem can never block the VM from booting. (Two branches rather
+    # than an array, to stay compatible with macOS /bin/bash 3.2 + set -u.)
+    if [ -d "$HOST_CACHE_DIR" ]; then
+        tart run --nested --no-graphics --dir="${TART_CACHE_TAG}:${HOST_CACHE_DIR}" "$CLONE_NAME" >> "$vm_runtime_log" 2>&1 &
+    else
+        tart run --nested --no-graphics "$CLONE_NAME" >> "$vm_runtime_log" 2>&1 &
+    fi
     local tart_pid=$!
+    log "[runner ${INDEX}] Tart runtime log: ${vm_runtime_log}"
 
     local ip=""
     cleanup_job() {
+        if [ "$run_failed" -eq 1 ]; then
+            capture_host_vm_diagnostics "$RUNNER_LABEL" "$CLONE_NAME"
+            err "[runner ${INDEX}] Failure reason: ${fail_reason}"
+            if [ -f "$vm_runtime_log" ]; then
+                err "[runner ${INDEX}] Tart runtime log size: $(wc -c < "$vm_runtime_log" | tr -d ' ') bytes"
+                err "[runner ${INDEX}] Last Tart runtime output:"
+                tail -n 40 "$vm_runtime_log" >&2 || true
+            else
+                err "[runner ${INDEX}] Tart runtime log missing: ${vm_runtime_log}"
+            fi
+            err "[runner ${INDEX}] Iteration failed; Tart runtime log: ${vm_runtime_log}"
+        fi
+
         [ -n "$ip" ] && stop_guest "$CLONE_NAME" "$ip"
         wait "$tart_pid" 2>/dev/null || true
-        tart delete "$CLONE_NAME" 2>/dev/null || true
+
+        if [ "$run_failed" -eq 1 ] && [ "$TART_KEEP_FAILED_VM" = "1" ]; then
+            err "[runner ${INDEX}] Keeping failed VM clone for inspection: ${CLONE_NAME}"
+        else
+            tart delete "$CLONE_NAME" 2>/dev/null || true
+        fi
     }
     trap cleanup_job RETURN
 
-    ip="$(tart_guest_ip "$CLONE_NAME")" || { err "[runner ${INDEX}] No IP"; return 1; }
+    ip="$(tart_guest_ip "$CLONE_NAME")" || {
+        run_failed=1
+        fail_reason="guest did not obtain IP"
+        err "[runner ${INDEX}] No IP"
+        return 1
+    }
     log "[runner ${INDEX}] Guest IP: $ip"
 
-    wait_for_ssh "$ip" || { err "[runner ${INDEX}] SSH never came up"; return 1; }
+    wait_for_ssh "$ip" || {
+        run_failed=1
+        fail_reason="guest SSH did not become ready"
+        err "[runner ${INDEX}] SSH never came up"
+        return 1
+    }
 
     log "[runner ${INDEX}] Minting registration token"
     local token
     token="$(mint_registration_token "$APP_ID" "$PRIVATE_KEY" "$REPO" "$ORG")" \
-        || { err "[runner ${INDEX}] Token minting failed"; return 1; }
+        || {
+            run_failed=1
+            fail_reason="token minting failed"
+            err "[runner ${INDEX}] Token minting failed"
+            return 1
+        }
 
     local runner_name
     runner_name="${NAME_PREFIX}-${INDEX}-$(date +%s)"
     log "[runner ${INDEX}] Configuring + running ephemeral runner: $runner_name"
 
+    # Best-effort: mount the shared host cache over virtio-fs and point sccache
+    # at it. This is purely an optimization, so a mount failure must never abort
+    # the job — hence the `|| echo ... (non-fatal)` guard. SCCACHE_DIR is set
+    # unconditionally; it's harmless until the workflow enables sccache, after
+    # which the cache is automatically persistent and network-free.
+    #
+    # Apple shares every --dir under the single automount tag, with our named
+    # share (TART_CACHE_TAG) as a sub-directory, so we mount that tag and use the
+    # <mount>/<TART_CACHE_TAG> sub-dir. virtio-fs maps host ownership through, so
+    # no chown is needed (and chowning the automount root is not permitted).
+    local cache_setup cache_subdir
+    cache_subdir="${TART_CACHE_GUEST_MOUNT}/${TART_CACHE_TAG}"
+    cache_setup="sudo mkdir -p '${TART_CACHE_GUEST_MOUNT}' && (mountpoint -q '${TART_CACHE_GUEST_MOUNT}' || sudo mount -t virtiofs '${TART_VIRTIOFS_AUTOMOUNT_TAG}' '${TART_CACHE_GUEST_MOUNT}')"
+
+    # Install the per-job context hook (base64 to avoid SSH quoting issues).
+    local hook_install
+    hook_install="echo '${JOB_STARTED_HOOK_B64}' | base64 -d | sudo tee '${GUEST_HOOK_PATH}' >/dev/null && sudo chmod +x '${GUEST_HOOK_PATH}'"
+
     # Configure as an ephemeral runner and execute a single job. run.sh blocks
     # until the job finishes, after which the ephemeral runner deregisters.
     if ! ssh_guest "$ip" \
-        "cd '${TART_GUEST_RUNNER_DIR}' && \
+        "{ ${cache_setup}; } || echo '[cache] virtio-fs mount failed (non-fatal)'; \
+         { ${hook_install}; } || echo '[hook] install failed (non-fatal)'; \
+         export SCCACHE_DIR='${cache_subdir}/sccache' SCCACHE_CACHE_SIZE='${TART_CACHE_MAX_SIZE}' ACTIONS_RUNNER_HOOK_JOB_STARTED='${GUEST_HOOK_PATH}'; \
+         cd '${TART_GUEST_RUNNER_DIR}' && \
          ./config.sh --unattended --ephemeral --replace \
             --url '${RUNNER_URL}' --token '${token}' \
             --labels '${TART_RUNNER_LABELS}' --name '${runner_name}' && \
          ./run.sh"; then
+        run_failed=1
+        fail_reason="remote runner command exited non-zero"
         err "[runner ${INDEX}] Runner exited non-zero (job may have failed)"
         return 1
     fi
