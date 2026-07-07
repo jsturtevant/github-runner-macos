@@ -1,13 +1,13 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 
-# Manual probe: confirm whether GitHub's hosted Windows ARM64 runner exposes
-# Hyper-V / Windows Hypervisor Platform capabilities.
+# Manual probe: compare Hyper-V / Windows Hypervisor Platform availability on
+# GitHub-hosted Windows ARM64 and x64 runners.
 #
 # This mirrors the Ubuntu KVM probe: it checks the runner identity, asserts the
-# expected Windows ARM64 environment, and fails if the Windows hypervisor or
+# expected Windows environment, and fails if the Windows hypervisor or
 # relevant optional features are not available.
 
-name: Check Hyper-V Windows ARM Runner
+name: Check Hyper-V Windows Runners
 
 on:
   workflow_dispatch:
@@ -21,8 +21,20 @@ permissions:
 
 jobs:
   check-hyperv:
-    name: Inspect Hyper-V on GitHub-hosted Windows ARM64 runner
-    runs-on: windows-11-arm
+    name: Inspect Hyper-V on ${{ matrix.runner_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_name: GitHub-hosted Windows ARM64 runner
+            runner_label: windows-11-arm
+            expected_architecture: Arm64
+            summary_title: GitHub-hosted Windows ARM64 Hyper-V check
+          - runner_name: GitHub-hosted Windows x64 runner
+            runner_label: windows-latest
+            expected_architecture: X64
+            summary_title: GitHub-hosted Windows x64 Hyper-V baseline check
+    runs-on: ${{ matrix.runner_label }}
 
     defaults:
       run:
@@ -60,7 +72,7 @@ jobs:
           Add-StepOutput "process_architecture" $processArchitecture
           Add-StepOutput "cpu_name" $cpuName
 
-      - name: Assert Windows ARM64 guest
+      - name: Assert expected Windows guest
         run: |
           $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
             [System.Runtime.InteropServices.OSPlatform]::Windows
@@ -71,12 +83,12 @@ jobs:
           }
 
           $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-          if ($osArchitecture -ne "Arm64") {
-            Write-Error "Expected ARM64 runner, got '$osArchitecture'."
+          if ($osArchitecture -ne "${{ matrix.expected_architecture }}") {
+            Write-Error "Expected ${{ matrix.expected_architecture }} runner, got '$osArchitecture'."
             exit 1
           }
 
-          Write-Host "Confirmed Windows ARM64 runner."
+          Write-Host "Confirmed Windows $osArchitecture runner."
 
       - name: Verify Hyper-V is available
         id: hyperv
@@ -166,11 +178,11 @@ jobs:
         if: always()
         run: |
           @(
-            "### GitHub-hosted Windows ARM64 Hyper-V check"
+            "### ${{ matrix.summary_title }}"
             ""
             "| Property | Value |"
             "| --- | --- |"
-            "| Runner label | windows-11-arm |"
+            "| Runner label | ${{ matrix.runner_label }} |"
             "| Computer | ${{ steps.identity.outputs.computer_name || 'unknown' }} |"
             "| OS | ${{ steps.identity.outputs.os_name || 'unknown' }} ${{ steps.identity.outputs.os_version || '' }} (build ${{ steps.identity.outputs.os_build || 'unknown' }}) |"
             "| OS architecture | ${{ steps.identity.outputs.os_architecture || 'unknown' }} |"
