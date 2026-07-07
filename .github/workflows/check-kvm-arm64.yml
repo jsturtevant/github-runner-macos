@@ -22,7 +22,7 @@ permissions:
 jobs:
   check-kvm:
     name: Inspect KVM on Tart ARM64 Linux runner
-    runs-on: [self-hosted, arm64, kvm, linux, ubuntu-24.04]
+    runs-on: [arm64, kvm, linux, ubuntu-24.04]
 
     steps:
       - name: Report runner identity
