@@ -1,0 +1,204 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+# Manual probe: compare Windows Hypervisor Platform availability on
+# GitHub-hosted Windows ARM64 and x64 runners.
+#
+# This mirrors the Ubuntu KVM probe: it checks the runner identity, asserts the
+# expected Windows environment, and fails if WHP is not available.
+
+name: Check WHP Windows Runners
+
+on:
+  workflow_dispatch:
+  # Path-scoped so it only runs on PRs that touch this probe, not every PR.
+  pull_request:
+    paths:
+      - .github/workflows/check-hyperv-arm64.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check-hyperv:
+    name: Inspect WHP on ${{ matrix.runner_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_name: GitHub-hosted Windows ARM64 runner
+            runner_label: windows-11-arm
+            expected_architecture: Arm64
+            summary_title: GitHub-hosted Windows ARM64 WHP check
+          - runner_name: GitHub-hosted Windows x64 runner
+            runner_label: windows-latest
+            expected_architecture: X64
+            summary_title: GitHub-hosted Windows x64 WHP baseline check
+    runs-on: ${{ matrix.runner_label }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Report runner identity
+        id: identity
+        run: |
+          function Add-StepOutput {
+            param([string] $Name, [object] $Value)
+            "${Name}=${Value}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+          $computerInfo = Get-ComputerInfo -Property OsName,OsVersion,OsBuildNumber,OsArchitecture,CsName
+          $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          $processArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+          $processor = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+          $cpuName = if ($processor.Name) { $processor.Name.Trim() } else { "unknown" }
+
+          Write-Host "::group::Runner identity"
+          Write-Host "Computer:             $($computerInfo.CsName)"
+          Write-Host "OS:                   $($computerInfo.OsName) $($computerInfo.OsVersion) (build $($computerInfo.OsBuildNumber))"
+          Write-Host "OS architecture:      $osArchitecture"
+          Write-Host "Process architecture: $processArchitecture"
+          Write-Host "CPU:                  $cpuName"
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          Write-Host "::endgroup::"
+
+          Add-StepOutput "computer_name" $computerInfo.CsName
+          Add-StepOutput "os_name" $computerInfo.OsName
+          Add-StepOutput "os_version" $computerInfo.OsVersion
+          Add-StepOutput "os_build" $computerInfo.OsBuildNumber
+          Add-StepOutput "os_architecture" $osArchitecture
+          Add-StepOutput "process_architecture" $processArchitecture
+          Add-StepOutput "cpu_name" $cpuName
+
+      - name: Assert expected Windows guest
+        run: |
+          $runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows
+          )
+          if (-not $runningOnWindows) {
+            Write-Error "Expected Windows runner."
+            exit 1
+          }
+
+          $osArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($osArchitecture -ne "${{ matrix.expected_architecture }}") {
+            Write-Error "Expected ${{ matrix.expected_architecture }} runner, got '$osArchitecture'."
+            exit 1
+          }
+
+          Write-Host "Confirmed Windows $osArchitecture runner."
+
+      - name: Verify WHP is available
+        id: hyperv
+        run: |
+          function Add-StepOutput {
+            param([string] $Name, [object] $Value)
+            "${Name}=${Value}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+          function Get-CimValue {
+            param([object] $Instance, [string] $Name)
+            $property = $Instance.CimInstanceProperties[$Name]
+            if ($null -eq $property) {
+              return "missing"
+            }
+            if ($null -eq $property.Value) {
+              return "null"
+            }
+            return $property.Value
+          }
+
+          function Get-FeatureState {
+            param([string] $FeatureName)
+            try {
+              $feature = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction Stop
+              return $feature.State.ToString()
+            } catch {
+              Write-Warning "Could not query optional feature '$FeatureName': $($_.Exception.Message)"
+              return "unavailable"
+            }
+          }
+
+          $computerInfo = Get-ComputerInfo -Property HyperVisorPresent
+          $processor = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+          $hypervisorPresent = [bool] $computerInfo.HyperVisorPresent
+          $virtualizationFirmwareEnabled = Get-CimValue $processor "VirtualizationFirmwareEnabled"
+          $vmMonitorModeExtensions = Get-CimValue $processor "VMMonitorModeExtensions"
+          $slatExtensions = Get-CimValue $processor "SecondLevelAddressTranslationExtensions"
+
+          $hyperVAllState = Get-FeatureState "Microsoft-Hyper-V-All"
+          $hypervisorPlatformState = Get-FeatureState "HypervisorPlatform"
+          $virtualMachinePlatformState = Get-FeatureState "VirtualMachinePlatform"
+          $hyperVModule = Get-Module -ListAvailable -Name Hyper-V | Select-Object -First 1
+          $hyperVModuleAvailable = $null -ne $hyperVModule
+
+          Write-Host "::group::Hyper-V diagnostics"
+          Write-Host "HyperVisorPresent:                         $hypervisorPresent"
+          Write-Host "VirtualizationFirmwareEnabled:             $virtualizationFirmwareEnabled"
+          Write-Host "VMMonitorModeExtensions:                   $vmMonitorModeExtensions"
+          Write-Host "SecondLevelAddressTranslationExtensions:   $slatExtensions"
+          Write-Host "Microsoft-Hyper-V-All:                     $hyperVAllState"
+          Write-Host "HypervisorPlatform:                        $hypervisorPlatformState"
+          Write-Host "VirtualMachinePlatform:                    $virtualMachinePlatformState"
+          Write-Host "Hyper-V PowerShell module available:       $hyperVModuleAvailable"
+          if ($hyperVModuleAvailable) {
+            Write-Host "Hyper-V PowerShell module path:            $($hyperVModule.Path)"
+          }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::systeminfo Hyper-V requirements"
+          systeminfo.exe |
+            Select-String -Pattern "Hyper-V Requirements|Virtualization Enabled|VM Monitor Mode|Second Level Address|Data Execution Prevention|A hypervisor has been detected" |
+            ForEach-Object { Write-Host $_.Line }
+          Write-Host "::endgroup::"
+
+          $hyperVAvailable = $hypervisorPresent -and ($hyperVAllState -eq "Enabled")
+          $whpAvailable = $hypervisorPresent -and ($hypervisorPlatformState -eq "Enabled")
+          $vmpAvailable = $hypervisorPresent -and ($virtualMachinePlatformState -eq "Enabled")
+
+          Add-StepOutput "hypervisor_present" $hypervisorPresent
+          Add-StepOutput "virtualization_firmware_enabled" $virtualizationFirmwareEnabled
+          Add-StepOutput "vm_monitor_mode_extensions" $vmMonitorModeExtensions
+          Add-StepOutput "slat_extensions" $slatExtensions
+          Add-StepOutput "hyper_v_all_state" $hyperVAllState
+          Add-StepOutput "hypervisor_platform_state" $hypervisorPlatformState
+          Add-StepOutput "virtual_machine_platform_state" $virtualMachinePlatformState
+          Add-StepOutput "hyper_v_module_available" $hyperVModuleAvailable
+          Add-StepOutput "hyper_v_available" $hyperVAvailable
+          Add-StepOutput "whp_available" $whpAvailable
+          Add-StepOutput "vmp_available" $vmpAvailable
+
+          if (-not $whpAvailable) {
+            Write-Error "WHP is not available: HyperVisorPresent=$hypervisorPresent, HypervisorPlatform=$hypervisorPlatformState"
+            exit 1
+          }
+
+          Write-Host "WHP is available on this runner."
+
+      - name: Summary
+        if: always()
+        run: |
+          @(
+            "### ${{ matrix.summary_title }}"
+            ""
+            "| Property | Value |"
+            "| --- | --- |"
+            "| Runner label | ${{ matrix.runner_label }} |"
+            "| Computer | ${{ steps.identity.outputs.computer_name || 'unknown' }} |"
+            "| OS | ${{ steps.identity.outputs.os_name || 'unknown' }} ${{ steps.identity.outputs.os_version || '' }} (build ${{ steps.identity.outputs.os_build || 'unknown' }}) |"
+            "| OS architecture | ${{ steps.identity.outputs.os_architecture || 'unknown' }} |"
+            "| Process architecture | ${{ steps.identity.outputs.process_architecture || 'unknown' }} |"
+            "| CPU | ${{ steps.identity.outputs.cpu_name || 'unknown' }} |"
+            "| HyperVisorPresent | ${{ steps.hyperv.outputs.hypervisor_present || 'not-run' }} |"
+            "| VirtualizationFirmwareEnabled | ${{ steps.hyperv.outputs.virtualization_firmware_enabled || 'not-run' }} |"
+            "| VMMonitorModeExtensions | ${{ steps.hyperv.outputs.vm_monitor_mode_extensions || 'not-run' }} |"
+            "| SecondLevelAddressTranslationExtensions | ${{ steps.hyperv.outputs.slat_extensions || 'not-run' }} |"
+            "| Microsoft-Hyper-V-All | ${{ steps.hyperv.outputs.hyper_v_all_state || 'not-run' }} |"
+            "| HypervisorPlatform | ${{ steps.hyperv.outputs.hypervisor_platform_state || 'not-run' }} |"
+            "| VirtualMachinePlatform | ${{ steps.hyperv.outputs.virtual_machine_platform_state || 'not-run' }} |"
+            "| Hyper-V PowerShell module | ${{ steps.hyperv.outputs.hyper_v_module_available || 'not-run' }} |"
+            "| Hyper-V available | ${{ steps.hyperv.outputs.hyper_v_available || 'not-run' }} |"
+            "| **WHP available** | **${{ steps.hyperv.outputs.whp_available || 'not-run' }}** |"
+            "| Virtual Machine Platform available | ${{ steps.hyperv.outputs.vmp_available || 'not-run' }} |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
