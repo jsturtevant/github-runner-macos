@@ -1,7 +1,6 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 
-# Manual probe: confirm the Tart/Ubuntu KVM runner actually exposes nested
-# virtualization inside the guest VM.
+# Manual probe: compare KVM availability on GitHub-hosted and Tart Ubuntu ARM64 runners.
 #
 # This mirrors the macOS virtualization probe in spirit: it checks the runner
 # identity, asserts the expected ARM64/Linux environment, and fails if /dev/kvm
@@ -21,8 +20,20 @@ permissions:
 
 jobs:
   check-kvm:
-    name: Inspect KVM on Tart ARM64 Linux runner
-    runs-on: [ubuntu-24.04-arm, ubuntu-24.04]
+    name: Inspect KVM on ${{ matrix.runner_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_name: GitHub-hosted ARM64 Linux runner
+            runner_labels: '["ubuntu-24.04-arm"]'
+            summary_title: GitHub-hosted ARM64 KVM check
+            summary_labels: ubuntu-24.04-arm
+          - runner_name: Tart ARM64 Linux runner
+            runner_labels: '["self-hosted", "arm64", "kvm", "linux", "ubuntu-24.04"]'
+            summary_title: Tart ARM64 KVM check
+            summary_labels: self-hosted, arm64, kvm, linux, ubuntu-24.04
+    runs-on: ${{ fromJSON(matrix.runner_labels) }}
 
     steps:
       - name: Report runner identity
@@ -79,8 +90,8 @@ jobs:
         id: kvm_ok
         run: |
           if ! command -v kvm-ok >/dev/null 2>&1; then
-            echo "::error::kvm-ok not found on PATH"
-            exit 1
+            sudo apt-get update
+            sudo apt-get install -y cpu-checker
           fi
 
           echo "Found kvm-ok: $(command -v kvm-ok)"
@@ -107,11 +118,11 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Tart KVM runner check"
+            echo "### ${{ matrix.summary_title }}"
             echo ""
             echo "| Property | Value |"
             echo "| --- | --- |"
-            echo "| Runner label set | self-hosted, arm64, kvm, linux, ubuntu-24.04 |"
+            echo "| Runner label(s) | ${{ matrix.summary_labels }} |"
             echo "| OS | ${{ steps.identity.outputs.os_name }} ${{ steps.identity.outputs.os_release }} |"
             echo "| Architecture | ${{ steps.identity.outputs.arch }} |"
             echo "| CPU | ${{ steps.identity.outputs.cpu_brand || 'unknown' }} |"
