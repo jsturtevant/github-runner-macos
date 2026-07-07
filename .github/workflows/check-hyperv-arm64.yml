@@ -154,8 +154,10 @@ jobs:
             ForEach-Object { Write-Host $_.Line }
           Write-Host "::endgroup::"
 
-          $featureReady = $hyperVAllState -eq "Enabled" -or $hypervisorPlatformState -eq "Enabled"
-          $hyperVAvailable = $hypervisorPresent -and $featureReady
+          $hyperVAvailable = $hypervisorPresent -and ($hyperVAllState -eq "Enabled")
+          $whpAvailable = $hypervisorPresent -and ($hypervisorPlatformState -eq "Enabled")
+          $vmpAvailable = $hypervisorPresent -and ($virtualMachinePlatformState -eq "Enabled")
+          $windowsVirtualizationAvailable = $hyperVAvailable -or $whpAvailable -or $vmpAvailable
 
           Add-StepOutput "hypervisor_present" $hypervisorPresent
           Add-StepOutput "virtualization_firmware_enabled" $virtualizationFirmwareEnabled
@@ -166,13 +168,16 @@ jobs:
           Add-StepOutput "virtual_machine_platform_state" $virtualMachinePlatformState
           Add-StepOutput "hyper_v_module_available" $hyperVModuleAvailable
           Add-StepOutput "hyper_v_available" $hyperVAvailable
+          Add-StepOutput "whp_available" $whpAvailable
+          Add-StepOutput "vmp_available" $vmpAvailable
+          Add-StepOutput "windows_virtualization_available" $windowsVirtualizationAvailable
 
-          if (-not $hyperVAvailable) {
-            Write-Error "Hyper-V/WHP is not available: HyperVisorPresent=$hypervisorPresent, Microsoft-Hyper-V-All=$hyperVAllState, HypervisorPlatform=$hypervisorPlatformState"
+          if (-not $windowsVirtualizationAvailable) {
+            Write-Error "Windows virtualization is not available: HyperVisorPresent=$hypervisorPresent, Microsoft-Hyper-V-All=$hyperVAllState, HypervisorPlatform=$hypervisorPlatformState, VirtualMachinePlatform=$virtualMachinePlatformState"
             exit 1
           }
 
-          Write-Host "Hyper-V/WHP is available on this runner."
+          Write-Host "Windows virtualization is available on this runner."
 
       - name: Summary
         if: always()
@@ -196,5 +201,8 @@ jobs:
             "| HypervisorPlatform | ${{ steps.hyperv.outputs.hypervisor_platform_state || 'not-run' }} |"
             "| VirtualMachinePlatform | ${{ steps.hyperv.outputs.virtual_machine_platform_state || 'not-run' }} |"
             "| Hyper-V PowerShell module | ${{ steps.hyperv.outputs.hyper_v_module_available || 'not-run' }} |"
-            "| **Hyper-V/WHP available** | **${{ steps.hyperv.outputs.hyper_v_available || 'not-run' }}** |"
+            "| Hyper-V available | ${{ steps.hyperv.outputs.hyper_v_available || 'not-run' }} |"
+            "| WHP available | ${{ steps.hyperv.outputs.whp_available || 'not-run' }} |"
+            "| Virtual Machine Platform available | ${{ steps.hyperv.outputs.vmp_available || 'not-run' }} |"
+            "| **Windows virtualization available** | **${{ steps.hyperv.outputs.windows_virtualization_available || 'not-run' }}** |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
