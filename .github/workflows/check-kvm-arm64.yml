@@ -95,6 +95,14 @@ jobs:
           stat -c 'mode=%a owner=%U group=%G' /dev/kvm
 
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            runner_user="${USER:-$(id -un)}"
+            echo "/dev/kvm exists but is not accessible by ${runner_user}; assigning device ownership to the runner user."
+            sudo chown "${runner_user}" /dev/kvm
+            ls -l /dev/kvm
+            stat -c 'mode=%a owner=%U group=%G' /dev/kvm
+          fi
+
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo "::error::/dev/kvm exists but is not readable/writable by this user"
             exit 1
           fi
