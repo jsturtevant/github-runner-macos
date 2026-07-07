@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 
-# Manual probe: compare KVM availability on GitHub-hosted and Tart Ubuntu ARM64 runners.
+# Manual probe: confirm whether GitHub's hosted Ubuntu ARM64 runner exposes KVM.
 #
 # This mirrors the macOS virtualization probe in spirit: it checks the runner
 # identity, asserts the expected ARM64/Linux environment, and fails if /dev/kvm
@@ -20,20 +20,8 @@ permissions:
 
 jobs:
   check-kvm:
-    name: Inspect KVM on ${{ matrix.runner_name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner_name: GitHub-hosted ARM64 Linux runner
-            runner_labels: '["ubuntu-24.04-arm"]'
-            summary_title: GitHub-hosted ARM64 KVM check
-            summary_labels: ubuntu-24.04-arm
-          - runner_name: Tart ARM64 Linux runner
-            runner_labels: '["self-hosted", "arm64", "kvm", "linux", "ubuntu-24.04"]'
-            summary_title: Tart ARM64 KVM check
-            summary_labels: self-hosted, arm64, kvm, linux, ubuntu-24.04
-    runs-on: ${{ fromJSON(matrix.runner_labels) }}
+    name: Inspect KVM on GitHub-hosted ARM64 Linux runner
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Report runner identity
@@ -118,11 +106,11 @@ jobs:
         if: always()
         run: |
           {
-            echo "### ${{ matrix.summary_title }}"
+            echo "### GitHub-hosted ARM64 KVM check"
             echo ""
             echo "| Property | Value |"
             echo "| --- | --- |"
-            echo "| Runner label(s) | ${{ matrix.summary_labels }} |"
+            echo "| Runner label | ubuntu-24.04-arm |"
             echo "| OS | ${{ steps.identity.outputs.os_name }} ${{ steps.identity.outputs.os_release }} |"
             echo "| Architecture | ${{ steps.identity.outputs.arch }} |"
             echo "| CPU | ${{ steps.identity.outputs.cpu_brand || 'unknown' }} |"
